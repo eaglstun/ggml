@@ -25,6 +25,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -50,7 +51,11 @@
 #define GGML_CUDA_CC_TURING          750
 #define GGML_CUDA_CC_AMPERE          800
 #define GGML_CUDA_CC_ADA_LOVELACE    890
-// While BW spans CC 1000, 1100 & 1200, we are integrating Tensor Core instructions available to 1200 family, see
+#define GGML_CUDA_CC_HOPPER          900
+// Jetson Thor is Blackwell SM110. The hand-written FP4 block-scale PTX below is currently SM120-only, but SM110
+// should still be detected so ggml can favor CUDA library kernels that may use Thor tcgen05 tensor cores.
+#define GGML_CUDA_CC_THOR            1100
+// While BW spans CC 1000, 1100 & 1200, the hand-written FP4 path integrates Tensor Core instructions available to 1200 family, see
 // https://docs.nvidia.com/cutlass/media/docs/cpp/blackwell_functionality.html#blackwell-sm120-gemms
 #define GGML_CUDA_CC_BLACKWELL       1200
 #define GGML_CUDA_CC_DGX_SPARK       1210
@@ -313,6 +318,10 @@ static bool amd_mfma_available(const int cc) {
 
 static bool amd_wmma_available(const int cc) {
     return (GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3(cc));
+}
+
+static bool thor_mma_available(const int cc) {
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_THOR;
 }
 
 static bool volta_mma_available(const int cc) {
@@ -1193,6 +1202,7 @@ struct ggml_cuda_graph {
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
+    bool warmup_started = false;
     bool warmup_complete = false;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
@@ -1209,6 +1219,23 @@ struct ggml_cuda_graph {
         return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env);
     }
 #endif
+};
+
+struct ggml_cuda_graph_key {
+    const void * first_node_ptr = nullptr;
+    uint64_t     signature      = 0;
+
+    bool operator==(const ggml_cuda_graph_key & other) const {
+        return first_node_ptr == other.first_node_ptr && signature == other.signature;
+    }
+};
+
+struct ggml_cuda_graph_key_hash {
+    size_t operator()(const ggml_cuda_graph_key & key) const {
+        const size_t ptr_hash = std::hash<const void *>{}(key.first_node_ptr);
+        const size_t sig_hash = std::hash<uint64_t>{}(key.signature);
+        return ptr_hash ^ (sig_hash + 0x9e3779b97f4a7c15ULL + (ptr_hash << 6) + (ptr_hash >> 2));
+    }
 };
 
 struct ggml_cuda_concurrent_event {
@@ -1373,20 +1400,40 @@ struct ggml_backend_cuda_context {
     int curr_stream_no = 0;
 
 #ifdef USE_CUDA_GRAPH
-    // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
-    // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
-    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    // The structural signature separates batch shapes and graph topologies even
+    // when a freed host tensor arena is recycled at the same first-node address.
+    std::unordered_map<ggml_cuda_graph_key, std::unique_ptr<ggml_cuda_graph>, ggml_cuda_graph_key_hash> cuda_graphs;
 
     int64_t last_graph_eviction_sweep = 0;
 
-    ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
-        const int64_t time_now = ggml_time_us();
+    static int64_t cuda_graph_env_ms_to_us(const char * name, int64_t default_ms) {
+        const char * value = getenv(name);
+        if (value == nullptr || value[0] == '\0') {
+            return default_ms * 1000;
+        }
 
-        // sweep every 5s, evicting cuda graphs unused for >=10s
-        if (time_now - last_graph_eviction_sweep >= 5'000'000) {
+        char * end = nullptr;
+        const long long parsed_ms = std::strtoll(value, &end, 10);
+        if (end == value || *end != '\0' || parsed_ms < 0) {
+            return default_ms * 1000;
+        }
+        return (int64_t) parsed_ms * 1000;
+    }
+
+    ggml_cuda_graph * cuda_graph(const ggml_cuda_graph_key & graph_key) {
+        const int64_t time_now = ggml_time_us();
+        static const int64_t sweep_interval_us =
+            cuda_graph_env_ms_to_us("GGML_CUDA_GRAPH_SWEEP_MS", 5000);
+        static const int64_t evict_after_us =
+            cuda_graph_env_ms_to_us("GGML_CUDA_GRAPH_EVICT_AFTER_MS", 10000);
+
+        // By default sweep every 5s, evicting CUDA graphs unused for >=10s.
+        // Set GGML_CUDA_GRAPH_EVICT_AFTER_MS=0 to keep captured graphs resident.
+        if (evict_after_us > 0 && sweep_interval_us > 0
+                && time_now - last_graph_eviction_sweep >= sweep_interval_us) {
             last_graph_eviction_sweep = time_now;
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
-                if (time_now - it->second->last_used_time >= 10'000'000) {
+                if (time_now - it->second->last_used_time >= evict_after_us) {
                     it = cuda_graphs.erase(it);
                 } else {
                     ++it;
@@ -1394,9 +1441,9 @@ struct ggml_backend_cuda_context {
             }
         }
 
-        auto it = cuda_graphs.find(first_node_ptr);
+        auto it = cuda_graphs.find(graph_key);
         if (it == cuda_graphs.end()) {
-            it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
+            it = cuda_graphs.emplace(graph_key, std::make_unique<ggml_cuda_graph>()).first;
         }
         it->second->last_used_time = time_now;
         return it->second.get();
@@ -1479,11 +1526,18 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;
     const ggml_tensor * gate = nullptr;
     const ggml_tensor * gate_bias = nullptr;
+    bool silu = false;
     ggml_glu_op glu_op;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
     const void * gate = nullptr;
     const void * gate_bias = nullptr;
+    // A Linear bias has shape [M, 1, 1, 1] and is broadcast across the
+    // destination columns/channels. Keep this explicit because the legacy
+    // fusion path also accepts a full-shape elementwise bias.
+    bool x_bias_broadcast = false;
+    bool gate_bias_broadcast = false;
+    bool silu = false;
     ggml_glu_op glu_op;
 };

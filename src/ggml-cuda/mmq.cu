@@ -127,7 +127,9 @@ void ggml_cuda_mul_mat_q(
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1 +
             get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+        const bool use_nvfp4_residual = use_native_fp4 && src0->type == GGML_TYPE_NVFP4;
+        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1 * (use_nvfp4_residual ? 2 : 1));
+        char * src1_residual = use_nvfp4_residual ? src1_q8_1.get() + nbytes_src1_q8_1 : nullptr;
 
         {
             const int64_t s11 = src1->nb[1] / ts_src1;
@@ -135,7 +137,7 @@ void ggml_cuda_mul_mat_q(
             const int64_t s13 = src1->nb[3] / ts_src1;
             if (use_native_fp4) {
                 static_assert(sizeof(block_fp4_mmq) == 4 * sizeof(block_q8_1));
-                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                quantize_mmq_fp4_cuda(src1_d, nullptr, src1_q8_1.get(), src1_residual, src0->type, ne10, s11, s12, s13, ne10_padded,
                                         ne11, ne12, ne13, stream);
 
             } else {
@@ -152,7 +154,7 @@ void ggml_cuda_mul_mat_q(
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
+            src0_d, src0->type, (const int *) src1_q8_1.ptr, (const int *) src1_residual, nullptr, nullptr, dst_d,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
@@ -185,7 +187,9 @@ void ggml_cuda_mul_mat_q(
 
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * sizeof(block_q8_1)/QK8_1 +
         get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+    const bool use_nvfp4_residual = use_native_fp4 && src0->type == GGML_TYPE_NVFP4;
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1 * (use_nvfp4_residual ? 2 : 1));
+    char * src1_residual = use_nvfp4_residual ? src1_q8_1.get() + nbytes_src1_q8_1 : nullptr;
 
     const int64_t ne11_flat = ne12*n_expert_used;
     const int64_t ne12_flat = 1;
@@ -197,7 +201,7 @@ void ggml_cuda_mul_mat_q(
         const int64_t s13 = src1->nb[3] / ts_src1;
 
         if (use_native_fp4) {
-            quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
+            quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_residual, src0->type, ne10, s11, s12, s13,
                                     ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
         } else {
             quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
@@ -213,7 +217,7 @@ void ggml_cuda_mul_mat_q(
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {
-        src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
+        src0_d, src0->type, (const int *) src1_q8_1.get(), (const int *) src1_residual, ids_dst.get(), expert_bounds.get(), dst_d,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
@@ -253,7 +257,7 @@ void ggml_cuda_op_mul_mat_q(
                             || GGML_CUDA_CC_IS_CDNA(cc))
                             && src1_ncols == ne11;
     const mmq_args args = {
-        src0_dd_i, src0->type, (const int *) src1_ddq_i, nullptr, nullptr, dst_dd_i,
+        src0_dd_i, src0->type, (const int *) src1_ddq_i, nullptr, nullptr, nullptr, dst_dd_i,
         ne00, row_diff, src1_ncols, stride01, ne11, nrows_dst,
         1, 1, 0, 0, 0,
         1, 1, 0, 0, 0,

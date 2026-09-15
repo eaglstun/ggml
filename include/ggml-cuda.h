@@ -24,6 +24,17 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
 
 GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
 
+// Returns the backend's current CUDA/HIP/MUSA stream for in-process device interop.
+// The returned stream is owned by the backend and must not be destroyed by the caller.
+GGML_BACKEND_API void * ggml_backend_cuda_get_stream(ggml_backend_t backend);
+
+// Returns the backend-owned native CUDA/HIP graph template for a stable GGML graph after its
+// normal warm-up/capture has completed. The opaque handle is borrowed and is intended for runtime
+// graph composition (for example, adding GGML inference as a child node of a larger pipeline
+// graph). It remains owned by the backend and must not be destroyed by the caller.
+GGML_BACKEND_API void * ggml_backend_cuda_get_graph_template(
+    ggml_backend_t backend, const struct ggml_cgraph * cgraph);
+
 // device buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
 

@@ -383,7 +383,10 @@ static void mul_mat_vec_f_switch_fusion(
         const dim3 & block_dims, const dim3 & block_nums, const int nbytes_shared, const int ids_stride, const cudaStream_t stream) {
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
-    if constexpr (ncols_dst == 1) {
+    // The same epilogue addressing works for two adjacent columns.  This is especially useful
+    // for classifier-free guidance: both lanes share the weight-row load and still fold the
+    // residual/bias writeback into the projection kernel.
+    if constexpr (ncols_dst <= 2) {
         if (has_fusion) {
             mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id><<<block_nums, block_dims, nbytes_shared, stream>>>
                 (x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
@@ -393,7 +396,7 @@ static void mul_mat_vec_f_switch_fusion(
        }
     }
 
-    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
+    GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst<=2");
 
     mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, is_multi_token_id><<<block_nums, block_dims, nbytes_shared, stream>>>
         (x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
@@ -434,6 +437,11 @@ void launch_mul_mat_vec_f_cuda(
         if (niter < niter_best) {
             niter_best      = niter;
             block_size_best = block_size;
+        }
+    }
+    if constexpr (std::is_same_v<T, half>) {
+        if (warp_size == 32 && ncols >= 768 && ncols_dst <= 2) {
+            block_size_best = 96;
         }
     }
 
@@ -650,7 +658,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
 
     if (fusion) {
         GGML_ASSERT( !ids || dst->ne[2] == 1);
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        GGML_ASSERT(  ids || dst->ne[1] <= 2);
         if (fusion->x_bias) {
             GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
@@ -793,9 +801,15 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
         }
     }
 
+    // Thor's tcgen05 paths are provided by CUDA libraries today; avoid ggml's warp-level vector kernels there.
+    const bool prefer_cublas_tcgen05 = thor_mma_available(cc);
+
     switch (type) {
         case GGML_TYPE_F32:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
+                if (prefer_cublas_tcgen05) {
+                    return false;
+                }
                 if (ampere_mma_available(cc)) {
                     return ne11 <= 3;
                 }
@@ -812,9 +826,12 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
             return ne11 <= 8;
         case GGML_TYPE_F16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
+                if (prefer_cublas_tcgen05) {
+                    return false;
+                }
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
                 if (ampere_mma_available(cc)) {
-                    return src0_small && ne11 == 1;
+                    return src0_small && ne11 <= 2;
                 }
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                     return src0_small && ne11 <= 4;
@@ -838,6 +855,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
             return ne11 <= 8;
         case GGML_TYPE_BF16:
             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
+                if (prefer_cublas_tcgen05) {
+                    return false;
+                }
                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
                 if (ampere_mma_available(cc)) {
                     return src0_small && ne11 == 1;

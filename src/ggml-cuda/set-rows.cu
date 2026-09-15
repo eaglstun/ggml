@@ -170,6 +170,26 @@ static __global__ void k_set_rows(const src_t * __restrict__ src0,
     GGML_UNUSED(ne13);
 }
 
+template <typename idx_t>
+static __global__ void k_set_rows_contiguous_f32x4(
+        const float * __restrict__ src0, const idx_t * __restrict__ rows,
+        float * __restrict__ dst, const int row_elements, const size_t dst_row_stride,
+        const size_t src_plane_stride, const size_t dst_plane_stride,
+        const size_t row_index_plane_stride) {
+    const int source_row = (int) blockIdx.x;
+    const int plane = (int) blockIdx.y;
+    const int64_t destination_row =
+        (int64_t) rows[source_row + (size_t) plane * row_index_plane_stride];
+    const float4 * src = (const float4 *) (
+        src0 + (size_t) plane * src_plane_stride + (size_t) source_row * row_elements);
+    float4 * out = (float4 *) (
+        dst + (size_t) plane * dst_plane_stride + destination_row * dst_row_stride);
+    const int vectors = row_elements / 4;
+    for (int i = threadIdx.x; i < vectors; i += blockDim.x) {
+        out[i] = src[i];
+    }
+}
+
 template<typename src_t, typename idx_t, typename dst_t>
 static void set_rows_cuda(
         const src_t * src0_d, const idx_t * src1_d, dst_t * dst_d,
@@ -321,6 +341,31 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
+
+    const bool contiguous_cache_rows =
+        dst->type == GGML_TYPE_F32 && src0->ne[3] == 1 &&
+        src1->ne[1] == src0->ne[2] && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+        dst->ne[2] == src0->ne[2] && dst->ne[3] == 1 && src0->ne[0] == dst->ne[0] &&
+        src0->ne[1] == src1->ne[0] && ggml_is_contiguous(src0) &&
+        dst->nb[0] == sizeof(float) && dst->nb[1] % sizeof(float4) == 0 &&
+        src0->ne[0] >= 1024 && src0->ne[0] % 4 == 0;
+    if (contiguous_cache_rows) {
+        const dim3 grid((unsigned) src0->ne[1], (unsigned) src0->ne[2]);
+        if (src1->type == GGML_TYPE_I64) {
+            k_set_rows_contiguous_f32x4<<<grid, 256, 0, ctx.stream()>>>(
+                (const float *) src0->data, (const int64_t *) src1->data,
+                (float *) dst->data, (int) src0->ne[0], dst->nb[1] / sizeof(float),
+                src0->nb[2] / sizeof(float), dst->nb[2] / sizeof(float),
+                src1->nb[1] / sizeof(int64_t));
+        } else {
+            k_set_rows_contiguous_f32x4<<<grid, 256, 0, ctx.stream()>>>(
+                (const float *) src0->data, (const int32_t *) src1->data,
+                (float *) dst->data, (int) src0->ne[0], dst->nb[1] / sizeof(float),
+                src0->nb[2] / sizeof(float), dst->nb[2] / sizeof(float),
+                src1->nb[1] / sizeof(int32_t));
+        }
+        return;
+    }
 
     if (src1->type == GGML_TYPE_I64) {
         set_rows_cuda<float, int64_t>(ctx, src0, src1, dst);

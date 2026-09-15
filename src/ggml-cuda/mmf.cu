@@ -159,6 +159,11 @@ bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const 
         return false;
     }
 
+    // Thor's tcgen05 paths are provided by CUDA libraries today; avoid ggml's warp-level matrix kernels there.
+    if (thor_mma_available(cc) && (type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16)) {
+        return false;
+    }
+
     if (mul_mat_id) {
         if (src0_ne[1] <= 1024 && src1_ncols > 512) {
             return false;

@@ -583,6 +583,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_FUSED_ATTN,
+
         GGML_OP_COUNT,
     };
 
@@ -620,6 +622,7 @@ extern "C" {
         GGML_GLU_OP_SWIGLU_OAI,
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
+        GGML_GLU_OP_SIGMOID,
 
         GGML_GLU_OP_COUNT,
     };
@@ -646,6 +649,10 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        // Model weight uses Q8_0 bytes serialized as one tensor-wide int8
+        // plane followed by one FP16 scale plane. CUDA-only storage hint;
+        // logical type, element count, and allocation size remain Q8_0.
+        GGML_TENSOR_FLAG_Q8_PLANAR = 32,
     };
 
     enum ggml_tri_type {
@@ -2415,6 +2422,81 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // Fused CUDA multi-head attention with optional relative-position terms
+    // and an optional persistent circular K/V cache. CPU and other backends
+    // report this op as unsupported.
+    //
+    // Logical shapes, with head dimension d_k as ne[0]:
+    //   q      [d_k, q_len,  n_head, batch]  pre-bias query (Qu/Qv added inside)
+    //   k      [d_k, kv_len, n_head, batch]
+    //   v      [d_k, kv_len, n_head, batch]
+    //   p      [d_k, pos_len, n_head]        positional encoding projection,
+    //                                        pos_len >= kv_len + q_len - 1
+    //   bias_u [d_k, n_head]                 pos_bias_u (content term)
+    //   bias_v [d_k, n_head]                 pos_bias_v (position term)
+    //   mask   [kv_len], [kv_len, q_len],    additive (0 / -inf) mask,
+    //          or [kv_len, batch], or NULL    offline per-query or streaming
+    //                                         per-stream columns
+    // Q/K/V/P may be non-contiguous views as long as each d_k row is
+    // contiguous — e.g. Q sliced from a fused-QKV projection and K/V read
+    // head-split from a feat-major [n_feat, kv] window (the CUDA op derives
+    // all addressing from the tensors' nb[]). bias_u/bias_v/mask must be
+    // contiguous.
+    // Output: [d_k, q_len, n_head, batch] (attention context, pre-output-proj).
+    // With merge_heads=true the output keeps that logical shape but uses a
+    // head-merged memory layout: permute(out, 0, 2, 1, 3) is a contiguous
+    // (n_feat, q_len, batch) matrix, consumable by the output projection
+    // without a copy.
+    GGML_API struct ggml_tensor * ggml_fused_relpos_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * p,
+            struct ggml_tensor  * bias_u,
+            struct ggml_tensor  * bias_v,
+            struct ggml_tensor  * mask,
+            float                 scale,
+            bool                  merge_heads);
+
+    // Streaming CUDA variant. K/V contain only the current chunk; cached K/V
+    // are read directly from a persistent [n_feat*cache_len, slots, 2] F32
+    // arena using one I32 slot id and circular-cache head per batch item.
+    // cache_state may be [batch] or [batch,2]; the optional second column is
+    // the number of valid past entries, allowing a fixed graph to skip unused
+    // cache rows. The caller advances the head after a successful graph run.
+    GGML_API struct ggml_tensor * ggml_fused_relpos_attn_cached(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * p,
+            struct ggml_tensor  * bias_u,
+            struct ggml_tensor  * bias_v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * kv_cache,
+            struct ggml_tensor  * slot_ids,
+            struct ggml_tensor  * cache_state,
+            int64_t               cache_len,
+            float                 scale,
+            bool                  merge_heads);
+
+    // Standard cached attention. Q/K/V are [d_k, chunk_len, n_head, batch].
+    // The current K/V chunk is attended and appended to the shared persistent
+    // [n_feat*cache_len, slots, 2] F32 circular cache.
+    GGML_API struct ggml_tensor * ggml_fused_attn_cached(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * kv_cache,
+            struct ggml_tensor  * slot_ids,
+            struct ggml_tensor  * cache_state,
+            int64_t               cache_len,
+            float                 scale,
+            bool                  merge_heads);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

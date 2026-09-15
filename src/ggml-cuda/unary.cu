@@ -183,6 +183,51 @@ void ggml_cuda_op_silu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_unary<op_silu>(ctx, dst);
 }
 
+static __global__ void silu_f32_to_f16(
+        const float * __restrict__ x, half * __restrict__ dst,
+        const int64_t nelements) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < nelements) {
+        dst[i] = __float2half(op_silu(x[i]));
+    }
+}
+
+static __global__ void silu_f32_to_bf16(
+        const float * __restrict__ x, nv_bfloat16 * __restrict__ dst,
+        const int64_t nelements) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < nelements) {
+        dst[i] = __float2bfloat16(op_silu(x[i]));
+    }
+#else
+    GGML_UNUSED_VARS(x, dst, nelements);
+    NO_DEVICE_CODE;
+#endif
+}
+
+void ggml_cuda_op_silu_f32_to_16(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * silu_node,
+        ggml_tensor * dst) {
+    const ggml_tensor * src = silu_node->src[0];
+    GGML_ASSERT(src->type == GGML_TYPE_F32);
+    GGML_ASSERT(silu_node->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_BF16 || dst->type == GGML_TYPE_F16);
+    GGML_ASSERT(ggml_are_same_shape(src, dst));
+    GGML_ASSERT(ggml_is_contiguous(src));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t nelements = ggml_nelements(src);
+    const int64_t num_blocks = (nelements + CUDA_SILU_BLOCK_SIZE - 1) / CUDA_SILU_BLOCK_SIZE;
+    if (dst->type == GGML_TYPE_BF16) {
+        silu_f32_to_bf16<<<num_blocks, CUDA_SILU_BLOCK_SIZE, 0, ctx.stream()>>>(
+            (const float *) src->data, (nv_bfloat16 *) dst->data, nelements);
+    } else {
+        silu_f32_to_f16<<<num_blocks, CUDA_SILU_BLOCK_SIZE, 0, ctx.stream()>>>(
+            (const float *) src->data, (half *) dst->data, nelements);
+    }
+}
+
 void ggml_cuda_op_tanh(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_unary<op_tanh>(ctx, dst);
 }
@@ -341,6 +386,10 @@ void ggml_cuda_op_geglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 void ggml_cuda_op_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_unary_gated<op_silu>(ctx, dst);
+}
+
+void ggml_cuda_op_sigmoid_glu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_op_unary_gated<op_sigmoid>(ctx, dst);
 }
 
 void ggml_cuda_op_geglu_erf(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

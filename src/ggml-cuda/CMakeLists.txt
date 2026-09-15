@@ -15,7 +15,8 @@ if (CUDAToolkit_FOUND)
         # 80     == Ampere, asynchronous data loading, faster tensor core instructions
         # 86     == RTX 3000, needs CUDA v11.1
         # 89     == RTX 4000, needs CUDA v11.8
-        # 120    == Blackwell, needs CUDA v12.8, FP4 tensor cores
+        # 110    == Jetson Thor, needs CUDA v13.0, Blackwell tensor cores
+        # 120    == Blackwell, needs CUDA v12.8, SM120 FP4 tensor cores
         #
         # XX-virtual == compile CUDA code as PTX, do JIT compilation to binary code on first run
         # XX-real    == compile CUDA code as device code for this specific architecture
@@ -34,6 +35,10 @@ if (CUDAToolkit_FOUND)
 
             if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "11.8")
                 list(APPEND CMAKE_CUDA_ARCHITECTURES 89-real)
+            endif()
+
+            if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
+                list(APPEND CMAKE_CUDA_ARCHITECTURES 110a-real)
             endif()
 
             if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
@@ -71,16 +76,16 @@ if (CUDAToolkit_FOUND)
         FetchContent_MakeAvailable(CCCL)
     endif()
 
-    # Replace any plain 12X CUDA architectures with their "architecture-specific" equivalents 12Xa.
-    # 12X is forwards-compatible, 12Xa is not.
-    # Notably the Blackwell FP4 tensor core instructions are not forwards compatible and therefore need 12Xa.
+    # Replace plain Blackwell CUDA architectures with their "architecture-specific" equivalents.
+    # 10X/11X/12X are forwards-compatible, 10Xa/11Xa/12Xa are not.
+    # Notably the Blackwell tensor core instructions are not forwards compatible and therefore need architecture-specific targets.
     # But while 12X vs. 12Xa can be checked in device code there is (to my knowledge) no easy way to do the same check in host code.
-    # So for now just replace all instances of 12X with 12Xa, this should be fine until Rubin is released.
+    # So for now just replace the supported plain Blackwell targets with architecture-specific targets.
     foreach(ARCHS IN ITEMS CMAKE_CUDA_ARCHITECTURES CMAKE_CUDA_ARCHITECTURES_NATIVE)
         set(FIXED_ARCHS "")
         foreach(ARCH IN LISTS ${ARCHS})
-            if (ARCH MATCHES "^12[0-9](-real|-virtual)?$")
-                string(REGEX REPLACE "^(12[0-9])((-real|-virtual)?)$" "\\1a\\2" FIXED_ARCH ${ARCH})
+            if (ARCH MATCHES "^(100|110|12[0-9])(-real|-virtual)?$")
+                string(REGEX REPLACE "^(100|110|12[0-9])((-real|-virtual)?)$" "\\1a\\2" FIXED_ARCH ${ARCH})
                 message(STATUS "Replacing ${ARCH} in ${ARCHS} with ${FIXED_ARCH}")
                 list(APPEND FIXED_ARCHS "${FIXED_ARCH}")
             else()
@@ -90,8 +95,8 @@ if (CUDAToolkit_FOUND)
         set(${ARCHS} ${FIXED_ARCHS})
     endforeach()
 
-    # If we try to compile a "native" build it will use the 12X architectures and fail.
-    # So we should instead use the native architectures as determined by CMake after replacing 12X with 12Xa.
+    # If we try to compile a "native" build it may use plain Blackwell architectures and fail.
+    # So we should instead use the native architectures as determined by CMake after replacing them with architecture-specific forms.
     # But if at the time of the build no GPUs are connected at all CMAKE_CUDA_ARCHITECTURES will contain garbage that we should not use.
     if (CMAKE_CUDA_ARCHITECTURES STREQUAL "native" AND CMAKE_CUDA_ARCHITECTURES_NATIVE MATCHES "^[0-9]+(a|f)?(-real|-virtual)?(;[0-9]+(a|f)?(-real|-virtual)?|;)*$")
         set(CMAKE_CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES_NATIVE})
@@ -127,6 +132,9 @@ if (CUDAToolkit_FOUND)
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
                             )
+
+    # The cached-F16 path uses portable CUDA conversion and cuBLAS kernels.
+    target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_SKINNY_Q8_CUBLAS_F16=1)
 
     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 

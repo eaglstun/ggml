@@ -29,6 +29,7 @@ void quantize_mmq_q8_1_cuda(
 void quantize_mmq_fp4_cuda(const float *   x,
                              const int32_t * ids,
                              void *          vy,
+                             void *          vy_residual,
                              ggml_type       type_src0,
                              int64_t         ne00,
                              int64_t         s01,

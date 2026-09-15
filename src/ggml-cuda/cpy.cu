@@ -407,7 +407,24 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     const bool can_be_transposed = nb01 == (int64_t)ggml_element_size(src0) &&
         src0->ne[3] == 1 && nb02 == ne00 * ne01 * (int64_t)ggml_element_size(src0);
 
-    if (src0->type == src1->type && contiguous_srcs) {
+    // Cache-aware ASR keeps the last time rows of a [C,T,B] tensor. The view
+    // is contiguous within each batch plane but has the original T stride
+    // between planes; materializing it with cpy_scalar performs six 64-bit
+    // div/mod operations per float. Express this common layout as one pitched
+    // device copy instead (for C512 K/V this is 512 x ~224 KiB rows).
+    const size_t elem_size = ggml_element_size(src0);
+    const size_t plane_bytes = (size_t) ne00 * ne01 * elem_size;
+    const bool pitched_f32_to_contiguous =
+        src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+        src0->ne[3] == 1 && ne == ne00 * ne01 * ne02 &&
+        nb00 == (int64_t) elem_size && nb01 == ne00 * (int64_t) elem_size &&
+        nb02 >= (int64_t) plane_bytes && ggml_is_contiguous(src1);
+
+    if (pitched_f32_to_contiguous && !ggml_is_contiguous(src0)) {
+        CUDA_CHECK(cudaMemcpy2DAsync(
+            src1_ddc, plane_bytes, src0_ddc, (size_t) nb02,
+            plane_bytes, (size_t) ne02, cudaMemcpyDeviceToDevice, main_stream));
+    } else if (src0->type == src1->type && contiguous_srcs) {
         GGML_ASSERT(ggml_nbytes(src0) == ggml_nbytes(src1));
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
         if (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16) {

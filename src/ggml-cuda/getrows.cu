@@ -70,6 +70,28 @@ static __global__ void k_get_rows_float(
     }
 }
 
+// Fast path for large F32 cache rows. One CTA owns an output row and moves
+// float4 vectors from the indexed arena row. The generic kernel creates one
+// CTA per 256 scalar columns and reloads/recomputes the same row metadata in
+// every CTA; a 57,344-element ASR K/V row therefore used 224 CTAs.
+static __global__ void k_get_rows_contiguous_f32x4(
+        const float * __restrict__ src0, const int32_t * __restrict__ rows,
+        float * __restrict__ dst, const int row_elements, const size_t src_row_stride,
+        const size_t src_plane_stride, const size_t dst_plane_stride,
+        const size_t row_index_plane_stride) {
+    const int output_row = (int) blockIdx.x;
+    const int plane = (int) blockIdx.y;
+    const int source_row = rows[output_row + (size_t) plane * row_index_plane_stride];
+    const float4 * src = (const float4 *) (
+        src0 + (size_t) plane * src_plane_stride + (size_t) source_row * src_row_stride);
+    float4 * out = (float4 *) (
+        dst + (size_t) plane * dst_plane_stride + (size_t) output_row * row_elements);
+    const int vectors = row_elements / 4;
+    for (int i = threadIdx.x; i < vectors; i += blockDim.x) {
+        out[i] = src[i];
+    }
+}
+
 template<typename grad_t, typename dst_t>
 static __global__ void k_get_rows_back_float(
         const grad_t * __restrict__ grad, const int32_t * __restrict__ rows, dst_t * __restrict__ dst, const int64_t ncols, const int64_t nrows_grad) {
@@ -263,6 +285,24 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));
     GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));
     GGML_ASSERT(dst->nb[0]  == ggml_type_size(dst->type));
+
+    const bool contiguous_cache_rows =
+        src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        src1->type == GGML_TYPE_I32 && src0->ne[3] == 1 &&
+        src1->ne[1] == src0->ne[2] && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+        dst->ne[2] == src0->ne[2] && dst->ne[3] == 1 && dst->ne[0] == src0->ne[0] &&
+        dst->ne[1] == src1->ne[0] && ggml_is_contiguous(dst) &&
+        src0->nb[0] == sizeof(float) && src0->nb[1] % sizeof(float4) == 0 &&
+        src0->ne[0] >= 1024 && src0->ne[0] % 4 == 0;
+    if (contiguous_cache_rows) {
+        const dim3 grid((unsigned) src1->ne[0], (unsigned) src0->ne[2]);
+        k_get_rows_contiguous_f32x4<<<grid, 256, 0, stream>>>(
+            (const float *) src0->data, (const int32_t *) src1->data,
+            (float *) dst->data, (int) src0->ne[0], src0->nb[1] / sizeof(float),
+            src0->nb[2] / sizeof(float), dst->nb[2] / sizeof(float),
+            src1->nb[1] / sizeof(int32_t));
+        return;
+    }
 
     get_rows_cuda(src0->data, src0->type, (const int32_t *) src1->data, dst->data, dst->type,
         ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);

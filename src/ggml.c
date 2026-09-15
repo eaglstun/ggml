@@ -1078,9 +1078,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "FUSED_ATTN",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1188,9 +1190,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "fused_attn(q,k,v,p)",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1228,9 +1232,10 @@ static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
     "SWIGLU_OAI",
     "GEGLU_ERF",
     "GEGLU_QUICK",
+    "SIGMOID_GLU",
 };
 
-static_assert(GGML_GLU_OP_COUNT == 6, "GGML_GLU_OP_COUNT != 6");
+static_assert(GGML_GLU_OP_COUNT == 7, "GGML_GLU_OP_COUNT != 7");
 
 
 static_assert(sizeof(struct ggml_object)%GGML_MEM_ALIGN == 0, "ggml_object size must be a multiple of GGML_MEM_ALIGN");
@@ -4494,7 +4499,16 @@ struct ggml_tensor * ggml_conv_1d(
                 ggml_reshape_2d(ctx, im2col, im2col->ne[0], (im2col->ne[2] * im2col->ne[1])), // [N, OL, IC * K] => [N*OL, IC * K]
                 ggml_reshape_2d(ctx, a, (a->ne[0] * a->ne[1]), a->ne[2]));                    // [OC，IC, K] => [OC, IC * K]
 
-    result = ggml_reshape_3d(ctx, result, im2col->ne[1], a->ne[2], im2col->ne[2]); // [N, OC, OL]
+    if (im2col->ne[2] == 1) {
+        result = ggml_reshape_3d(ctx, result, im2col->ne[1], a->ne[2], 1);
+    } else {
+        // mul_mat produces [N*OL, OC]. Restore the flattened axes before moving
+        // the batch axis behind the output channels; a direct [OL, OC, N]
+        // reshape interleaves OC and N when N > 1.
+        result =
+            ggml_reshape_3d(ctx, result, im2col->ne[1], im2col->ne[2], a->ne[2]);
+        result = ggml_cont(ctx, ggml_permute(ctx, result, 0, 2, 1, 3));
+    }
 
     return result;
 }
@@ -5368,6 +5382,170 @@ struct ggml_tensor * ggml_flash_attn_ext(
     result->src[3] = mask;
 
     return result;
+}
+
+// ggml_fused_attention
+
+static struct ggml_tensor * ggml_fused_attention_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * p,
+        struct ggml_tensor  * bias_u,
+        struct ggml_tensor  * bias_v,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * kv_cache,
+        struct ggml_tensor  * slot_ids,
+        struct ggml_tensor  * cache_state,
+        int64_t               cache_len,
+        float                 scale,
+        bool                  merge_heads) {
+    // Q/K/V/P may be arbitrary-strided views; the CUDA op derives addressing
+    // from their nb[]. Only each d_k row must be contiguous (vectorized row
+    // loads).
+    GGML_ASSERT(q->nb[0] == ggml_type_size(q->type));
+    GGML_ASSERT(k->nb[0] == ggml_type_size(k->type));
+    GGML_ASSERT(v->nb[0] == ggml_type_size(v->type));
+    const bool relative = p != NULL;
+    GGML_ASSERT(relative == (bias_u != NULL));
+    GGML_ASSERT(relative == (bias_v != NULL));
+    if (relative) {
+        GGML_ASSERT(p->nb[0] == ggml_type_size(p->type));
+        GGML_ASSERT(ggml_is_contiguous(bias_u));
+        GGML_ASSERT(ggml_is_contiguous(bias_v));
+    }
+
+    const int64_t d_k      = q->ne[0];
+    const int64_t chunk_len = k->ne[1];
+    const int64_t kv_len   = cache_len + chunk_len;
+    const int64_t q_len    = q->ne[1];
+    const int64_t n_head   = q->ne[2];
+
+    GGML_ASSERT(k->ne[0] == d_k && v->ne[0] == d_k);
+    // The kernel reads rel-pos rows (q_len-1)+j-i for j in [0,kv_len), i in
+    // [0,q_len) — i.e. rows [0, kv_len+q_len-1) — and takes its head stride
+    // from p->nb, so a longer table (e.g. precomputed for the full chunk
+    // length and reused by shorter tail chunks) is safe.
+    if (relative) {
+        GGML_ASSERT(p->ne[0] == d_k);
+        GGML_ASSERT(bias_u->ne[0] == d_k && bias_v->ne[0] == d_k);
+        GGML_ASSERT(p->ne[1] >= kv_len + q_len - 1);  // rel-pos length
+    }
+    GGML_ASSERT(v->ne[1] == chunk_len);
+    GGML_ASSERT(cache_len >= 0);
+    GGML_ASSERT((kv_cache == NULL) == (slot_ids == NULL));
+    GGML_ASSERT((kv_cache == NULL) == (cache_state == NULL));
+    if (kv_cache) {
+        GGML_ASSERT(cache_len > 0);
+        GGML_ASSERT(kv_cache->type == GGML_TYPE_F32 && ggml_is_contiguous(kv_cache));
+        GGML_ASSERT(kv_cache->ne[0] == d_k * n_head * cache_len);
+        GGML_ASSERT(kv_cache->ne[2] == 2 && kv_cache->ne[3] == 1);
+        GGML_ASSERT(slot_ids->type == GGML_TYPE_I32 && ggml_is_contiguous(slot_ids));
+        GGML_ASSERT(slot_ids->ne[0] == q->ne[3]);
+        GGML_ASSERT(cache_state->type == GGML_TYPE_I32 && ggml_is_contiguous(cache_state));
+        GGML_ASSERT(cache_state->ne[0] == q->ne[3]);
+        GGML_ASSERT(cache_state->ne[1] == 1 || cache_state->ne[1] == 2);
+    } else {
+        GGML_ASSERT(cache_len == 0);
+    }
+    if (mask) {
+        GGML_ASSERT(ggml_is_contiguous(mask));
+        GGML_ASSERT(mask->ne[0] == kv_len);
+        if (kv_cache) {
+            // Cache-aware streaming: one shared key mask, or one column per
+            // batch item whose history has its own validity.
+            GGML_ASSERT(mask->ne[1] == 1 || mask->ne[1] == q->ne[3]);
+            GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == 1);
+        } else {
+            // Offline: a shared/per-batch key vector or a [key,query]
+            // local-attention mask, broadcast over heads.
+            GGML_ASSERT(mask->ne[1] == 1 || mask->ne[1] == q_len);
+            GGML_ASSERT(mask->ne[2] == 1 && (mask->ne[3] == 1 || mask->ne[3] == q->ne[3]));
+        }
+    }
+
+    // Output mirrors q logically: [d_k, q_len, n_head, batch]. With
+    // merge_heads the memory layout interleaves heads inside each query
+    // column (nb[2] = d_k, nb[1] = d_k*n_head) so that permute(0,2,1,3) of
+    // the result is a contiguous (d_k*n_head, q_len, batch) matrix.
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, q->ne);
+    if (merge_heads) {
+        const size_t ts = ggml_type_size(result->type);
+        result->nb[0] = ts;
+        result->nb[2] = (size_t) d_k * ts;
+        result->nb[1] = (size_t) d_k * n_head * ts;
+        result->nb[3] = (size_t) d_k * n_head * q_len * ts;
+    }
+
+    ggml_set_op_params(result, &scale, sizeof(scale));
+    ggml_set_op_params_i32(result, 1, (int32_t) cache_len);
+
+    result->op     = GGML_OP_FUSED_ATTN;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = p;
+    result->src[4] = bias_u;
+    result->src[5] = bias_v;
+    result->src[6] = mask;
+    result->src[7] = kv_cache;
+    result->src[8] = slot_ids;
+    result->src[9] = cache_state;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_fused_relpos_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * p,
+        struct ggml_tensor  * bias_u,
+        struct ggml_tensor  * bias_v,
+        struct ggml_tensor  * mask,
+        float                 scale,
+        bool                  merge_heads) {
+    return ggml_fused_attention_impl(
+        ctx, q, k, v, p, bias_u, bias_v, mask, NULL, NULL, NULL, 0, scale, merge_heads);
+}
+
+struct ggml_tensor * ggml_fused_relpos_attn_cached(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * p,
+        struct ggml_tensor  * bias_u,
+        struct ggml_tensor  * bias_v,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * kv_cache,
+        struct ggml_tensor  * slot_ids,
+        struct ggml_tensor  * cache_state,
+        int64_t               cache_len,
+        float                 scale,
+        bool                  merge_heads) {
+    return ggml_fused_attention_impl(
+        ctx, q, k, v, p, bias_u, bias_v, mask, kv_cache, slot_ids, cache_state, cache_len, scale,
+        merge_heads);
+}
+
+struct ggml_tensor * ggml_fused_attn_cached(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * kv_cache,
+        struct ggml_tensor  * slot_ids,
+        struct ggml_tensor  * cache_state,
+        int64_t               cache_len,
+        float                 scale,
+        bool                  merge_heads) {
+    return ggml_fused_attention_impl(
+        ctx, q, k, v, NULL, NULL, NULL, mask, kv_cache, slot_ids, cache_state, cache_len, scale,
+        merge_heads);
 }
 
 void ggml_flash_attn_ext_set_prec(
