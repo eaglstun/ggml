@@ -6257,7 +6257,8 @@ static void ggml_compute_forward_im2col_f16(
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F16);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 ||
+                src0->type == GGML_TYPE_BF16);
     GGML_ASSERT(src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_F32);
     GGML_ASSERT( dst->type == GGML_TYPE_F16);
 
@@ -6288,7 +6289,7 @@ static void ggml_compute_forward_im2col_f16(
     int ofs0 = is_2D ? nb13 : nb12;
     int ofs1 = is_2D ? nb12 : nb11;
 
-    GGML_ASSERT(nb00 == sizeof(ggml_fp16_t));
+    GGML_ASSERT(nb00 == ggml_type_size(src0->type));
     GGML_ASSERT(nb10 == ggml_type_size(src1->type));
 
     // im2col: [N, IC, IH, IW] => [N, OH, OW, IC*KH*KW]
@@ -6332,6 +6333,87 @@ static void ggml_compute_forward_im2col_f16(
     }
 }
 
+// ggml_compute_forward_im2col_bf16
+// src0: kernel [OC, IC, KH, KW]
+// src1: image [N, IC, IH, IW]
+// dst:  result [N, OH, OW, IC*KH*KW]
+static void ggml_compute_forward_im2col_bf16(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_BF16);
+    GGML_ASSERT(src1->type == GGML_TYPE_BF16 || src1->type == GGML_TYPE_F32);
+    GGML_ASSERT( dst->type == GGML_TYPE_BF16);
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+
+    const int32_t s0 = ((const int32_t *)(dst->op_params))[0];
+    const int32_t s1 = ((const int32_t *)(dst->op_params))[1];
+    const int32_t p0 = ((const int32_t *)(dst->op_params))[2];
+    const int32_t p1 = ((const int32_t *)(dst->op_params))[3];
+    const int32_t d0 = ((const int32_t *)(dst->op_params))[4];
+    const int32_t d1 = ((const int32_t *)(dst->op_params))[5];
+    const bool is_2D = ((const int32_t *)(dst->op_params))[6] == 1;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t N  = is_2D ? ne13 : ne12;
+    const int64_t IC = is_2D ? ne12 : ne11;
+    const int64_t IH = is_2D ? ne11 : 1;
+    const int64_t IW = ne10;
+
+    const int64_t KH = is_2D ? ne01 : 1;
+    const int64_t KW = ne00;
+
+    const int64_t OH = is_2D ? ne2 : 1;
+    const int64_t OW = ne1;
+
+    const int ofs0 = is_2D ? nb13 : nb12;
+    const int ofs1 = is_2D ? nb12 : nb11;
+
+    GGML_ASSERT(nb00 == sizeof(ggml_bf16_t));
+    GGML_ASSERT(nb10 == ggml_type_size(src1->type));
+
+    ggml_bf16_t * const wdata = (ggml_bf16_t *) dst->data;
+
+    for (int64_t in = 0; in < N; in++) {
+        for (int64_t ioh = 0; ioh < OH; ioh++) {
+            for (int64_t iow = 0; iow < OW; iow++) {
+                for (int64_t iic = ith; iic < IC; iic += nth) {
+                    ggml_bf16_t * dst_data =
+                        wdata + (in*OH*OW + ioh*OW + iow)*(IC*KH*KW);
+                    const float * const src_data_f32 = src1->type == GGML_TYPE_F32
+                        ? (const float *)((const char *) src1->data + in*ofs0 + iic*ofs1)
+                        : nullptr;
+                    const ggml_bf16_t * const src_data_bf16 = src1->type == GGML_TYPE_BF16
+                        ? (const ggml_bf16_t *)((const char *) src1->data + in*ofs0 + iic*ofs1)
+                        : nullptr;
+
+                    for (int64_t ikh = 0; ikh < KH; ikh++) {
+                        for (int64_t ikw = 0; ikw < KW; ikw++) {
+                            const int64_t iiw = iow*s0 + ikw*d0 - p0;
+                            const int64_t iih = ioh*s1 + ikh*d1 - p1;
+                            const int64_t dst_idx = iic*(KH*KW) + ikh*KW + ikw;
+
+                            if (iih < 0 || iih >= IH || iiw < 0 || iiw >= IW) {
+                                dst_data[dst_idx] = GGML_FP32_TO_BF16(0.0f);
+                            } else if (src_data_f32 != nullptr) {
+                                dst_data[dst_idx] = GGML_FP32_TO_BF16(src_data_f32[iih*IW + iiw]);
+                            } else {
+                                dst_data[dst_idx] = src_data_bf16[iih*IW + iiw];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_im2col(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
@@ -6343,6 +6425,10 @@ void ggml_compute_forward_im2col(
         case GGML_TYPE_F32:
             {
                 ggml_compute_forward_im2col_f32(params, dst);
+            } break;
+        case GGML_TYPE_BF16:
+            {
+                ggml_compute_forward_im2col_bf16(params, dst);
             } break;
         default:
             {
